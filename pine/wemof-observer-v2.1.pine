@@ -1,0 +1,320 @@
+//@version=6
+// 5分足表示。履歴は全1分足、LIVEは受信した価格更新。2つの集計を混ぜない。
+// 参考価格観測であり実約定・Bid/Ask・自動売買ではない。
+indicator("WEMOF Observer v2.1 | 5m display / 1m history + live updates", overlay=true, max_labels_count=300)
+n = input.int(20, "5分BB期間", minval=12, maxval=200, group="観測条件")
+k = input.float(3, "偏差σ", minval=0.1, maxval=10, step=0.1, group="観測条件")
+target = input.float(3, "戻り目標pips", minval=0.1, step=0.1, group="観測条件")
+stop = input.float(10, "逆行判定pips", minval=0.1, step=0.1, group="観測条件")
+watch = input.int(15, "観測期限（分）", minval=1, maxval=15, group="観測条件")
+cost = input.float(0.3, "参考往復コストpips（実スプレッドではない）", minval=0, step=0.1, group="観測条件")
+minuteGap = input.int(0, "履歴で許容する欠落1分足の本数", minval=0, maxval=10, group="データ品質")
+liveGap = input.int(60, "LIVE更新の空白上限（秒）", minval=1, maxval=600, group="データ品質")
+observeLive = input.bool(true, "起動後の価格更新を観測", group="LIVE")
+jsonAlerts = input.bool(true, "LIVEイベントJSON通知", group="LIVE")
+showBB = input.bool(true, "5分BB表示", group="表示")
+showBoundary = input.bool(false, "3σ接触価格の境界表示", group="表示")
+showHistory = input.bool(true, "履歴1分判定のマーク", group="表示")
+showLive = input.bool(true, "LIVE判定のマーク", group="表示")
+if barstate.isfirst
+    if not chart.is_standard or not timeframe.isminutes or timeframe.multiplier != 5
+        runtime.error("USDJPYの通常5分足チャートに追加してください。")
+    if syminfo.basecurrency != "USD" or syminfo.currency != "JPY"
+        runtime.error("USDJPY専用です。")
+    if n - 1 <= k * k
+        runtime.error("BB期間-1 > σ² が必要です。")
+float pip = 0.01
+float eps = 0.000001
+// 前19本の確定5分終値を使用。現在の5分足終値は接触境界に使わない。
+float m = ta.sma(close[1], n - 1)
+float v = ta.variance(close[1], n - 1, true)
+float radius = k * math.sqrt(n * v / (n - 1 - k * k))
+float touchUpper = m + radius
+float touchLower = m - radius
+bool ready = not na(m) and v > 0
+float basis = ta.sma(close, n)
+float dev = k * ta.stdev(close, n, true)
+// 5分内のすべての利用可能1分足を時刻順に取得。秒足リクエストはない。
+[mt, me, mo, mh, ml, mc] = request.security_lower_tf(syminfo.tickerid, "1", [time, time_close, open, high, low, close], calc_bars_count=100000)
+type Position
+    int id
+    int direction
+    int sourceStart
+    int detected
+    float reference
+    float mae
+    float mfe
+type LivePosition
+    int id
+    int direction
+    int sourceStart
+    int detected
+    float reference
+    varip float mae = 0
+    varip float mfe = 0
+// LIVEの極値はフィールドにもvaripを指定。履歴Positionはrollbackする。
+
+type Mark
+    int at
+    float price
+    int direction
+    int code
+// stats: contacts, TP, SL, TIME, UNKNOWN, GAP, net, durationTP, completed, MAEsum, MFEsum
+var array<float> hs = array.new_float(11, 0)
+varip array<float> ls = array.new_float(11, 0)
+var array<Position> ha = array.new<Position>()
+varip array<LivePosition> la = array.new<LivePosition>()
+varip array<Mark> liveMarks = array.new<Mark>()
+varip int liveBar = na
+varip int usedLiveBar = na
+varip int livePrevious = na
+varip int liveStarted = na
+var int historyPrevious = na
+var int noMinuteBars = 0
+var int historicalFirst = na
+var int historicalLast = na
+var array<float> output = array.new_float(36, na)
+array.fill(output, na)
+array<string> events = array.new_string()
+f_snapshot(LivePosition p) =>
+    Position.new(p.id, p.direction, p.sourceStart, p.detected, p.reference, p.mae, p.mfe)
+f_inc(array<float> s, int i, float amount) =>
+    array.set(s, i, array.get(s, i) + amount)
+f_number(float x) =>
+    na(x) ? "null" : str.tostring(x, "#.########")
+f_json(Position p, int at, string kind, int code, float net) =>
+    "{\"kind\":\"" + kind + "\",\"id\":" + str.tostring(p.id) + ",\"observed_ms\":" + str.tostring(at) + ",\"direction\":" + str.tostring(p.direction) + ",\"reference\":" + f_number(p.reference) + ",\"code\":" + str.tostring(code) + ",\"elapsed_s\":" + f_number((at - p.detected) / 1000.0) + ",\"mae_observed_pips\":" + f_number(p.mae) + ",\"mfe_observed_pips\":" + f_number(p.mfe) + ",\"reference_net_pips\":" + f_number(net) + "}"
+f_finish(array<float> s, Position p, int code, int at, float endPrice, bool live, int slot) =>
+    int index = code == 1 ? 1 : code == 2 ? 2 : code == 3 ? 3 : code == 5 ? 5 : 4
+    f_inc(s, index, 1)
+    float elapsed = math.max(0, (at - p.detected) / 1000.0)
+    // LIVEは観測した価格で計算。履歴TP/SLは閾値の参考値。4/5/6は損益なし。
+    float net = code == 1 ? (live ? (endPrice - p.reference) * p.direction / pip : target) - cost : code == 2 ? (live ? (endPrice - p.reference) * p.direction / pip : -stop) - cost : code == 3 ? (endPrice - p.reference) * p.direction / pip - cost : float(na)
+    if code == 1
+        f_inc(s, 7, elapsed)
+    if not na(net)
+        f_inc(s, 6, net)
+    if p.direction != 0
+        f_inc(s, 8, 1)
+        f_inc(s, 9, p.mae)
+        f_inc(s, 10, p.mfe)
+    if live
+        array.push(events, f_json(p, at, "result", code, net))
+        array.push(liveMarks, Mark.new(at, endPrice, p.direction, code))
+    else if slot < 4
+        int o = slot * 9
+        array.set(output, o, float(p.id))
+        array.set(output, o + 1, float(p.direction))
+        array.set(output, o + 2, p.reference)
+        array.set(output, o + 3, float(code))
+        array.set(output, o + 4, elapsed)
+        array.set(output, o + 5, p.mae)
+        array.set(output, o + 6, p.mfe)
+        array.set(output, o + 7, net)
+        array.set(output, o + 8, float(at))
+    net
+f_history(Position p, int t, int e, float o, float h, float l, float c, bool gap) =>
+    int code = 0
+    bool first = t == p.sourceStart
+    float opening = (o - p.reference) * p.direction / pip
+    if gap and not first or not first and t >= p.detected + watch * 60000
+        code := 5
+    else if not first and opening >= target - eps
+        p.mfe := math.max(p.mfe, opening)
+        code := 1
+    else if not first and opening <= -stop + eps
+        p.mae := math.max(p.mae, -opening)
+        code := 2
+    else
+        float favorable = p.direction == 1 ? (h - p.reference) / pip : (p.reference - l) / pip
+        float adverse = p.direction == 1 ? (p.reference - l) / pip : (h - p.reference) / pip
+        p.mae := math.max(p.mae, math.max(0, adverse))
+        p.mfe := math.max(p.mfe, math.max(0, favorable))
+        bool tp = favorable >= target - eps
+        bool sl = adverse >= stop - eps
+        bool closeTP = (c - p.reference) * p.direction / pip >= target - eps
+        if tp and sl or first and tp and not closeTP
+            code := 4
+        else if sl
+            code := 2
+        else if tp
+            code := 1
+        else if e - p.detected >= watch * 60000
+            code := 3
+    code
+f_mark(int at, float price, int d, int code, bool live) =>
+    string name = code == 0 ? (d == 1 ? "BUY" : d == -1 ? "SELL" : "両側不明") : code == 1 ? "TP" : code == 2 ? "SL" : code == 3 ? "TIME" : code == 5 ? "GAP" : "順序不明"
+    color shade = code == 0 ? color.blue : code == 1 ? color.teal : code == 2 ? color.red : color.gray
+    label.new(at, price, (live ? "LIVE " : "1m ") + name, xloc=xloc.bar_time, yloc=yloc.price, style=code == 0 and d == 1 ? label.style_label_up : label.style_label_down, color=color.new(shade, live ? 0 : 35), textcolor=color.white, size=size.tiny)
+
+// 履歴エンジン：未確定5分足ではrollback後に、その足内の確定1分を再処理する。
+// var のみで保持するため、同一1分を累計へ二重加算しない。
+bool usedHistory = false
+int finished = 0
+float contactId = na
+float contactDirection = na
+float contactReference = na
+float contactAt = na
+int available = array.size(mt)
+if available == 0 and barstate.isconfirmed
+    noMinuteBars += 1
+if available > 0
+    for i = 0 to available - 1
+        int t = array.get(mt, i)
+        int e = array.get(me, i)
+        bool closed = not barstate.isrealtime or e <= timenow
+        if closed
+            float o = array.get(mo, i)
+            float h = array.get(mh, i)
+            float l = array.get(ml, i)
+            float c = array.get(mc, i)
+            bool gap = not na(historyPrevious) and t - historyPrevious > minuteGap * 60000
+            historicalFirst := na(historicalFirst) ? t : historicalFirst
+            historicalLast := e
+            if array.size(ha) > 0
+                for j = array.size(ha) - 1 to 0
+                    Position p = array.get(ha, j)
+                    int code = f_history(p, t, e, o, h, l, c, gap)
+                    if code > 0
+                        f_finish(hs, p, code, e, c, false, finished)
+                        finished += 1
+                        if showHistory
+                            f_mark(e, c, p.direction, code, false)
+                        array.remove(ha, j)
+            if ready and not usedHistory and (h >= touchUpper or l <= touchLower)
+                usedHistory := true
+                f_inc(hs, 0, 1)
+                int d = h >= touchUpper and l <= touchLower ? 0 : l <= touchLower ? 1 : -1
+                float ref = d == 1 ? math.min(o, touchLower) : d == -1 ? math.max(o, touchUpper) : float(na)
+                Position p = Position.new(time, d, t, e, ref, 0, 0)
+                contactId := float(time)
+                contactDirection := float(d)
+                contactReference := ref
+                contactAt := float(e)
+                if showHistory
+                    f_mark(e, na(ref) ? c : ref, d, 0, false)
+                int code = d == 0 ? 6 : f_history(p, t, e, o, h, l, c, false)
+                if code > 0
+                    f_finish(hs, p, code, e, c, false, finished)
+                    finished += 1
+                    if showHistory
+                        f_mark(e, c, d, code, false)
+                else
+                    array.push(ha, p)
+            historyPrevious := e
+
+// LIVEエンジン：過去OHLCを再利用せず、この実行で受信したcloseだけを順番に観測。
+// varip で5分足内のrollbackを回避。再読み込み時にはこの履歴は失われる。
+if barstate.isrealtime and observeLive
+    int now = timenow
+    liveStarted := na(liveStarted) ? now : liveStarted
+    if na(liveBar) or liveBar != time
+        liveBar := time
+        array.clear(liveMarks)
+    bool gap = not na(livePrevious) and now - livePrevious > liveGap * 1000
+    if array.size(la) > 0
+        for j = array.size(la) - 1 to 0
+            LivePosition p = array.get(la, j)
+            float move = (close - p.reference) * p.direction / pip
+            int code = 0
+            if gap
+                code := 5
+            else
+                p.mae := math.max(p.mae, math.max(0, -move))
+                p.mfe := math.max(p.mfe, math.max(0, move))
+                if now - p.detected >= watch * 60000
+                    code := 3
+                else if move >= target - eps
+                    code := 1
+                else if move <= -stop + eps
+                    code := 2
+            if code > 0
+                f_finish(ls, f_snapshot(p), code, now, close, true, 0)
+                array.remove(la, j)
+    bool canEnter = na(usedLiveBar) or usedLiveBar != time
+    if ready and canEnter and (close >= touchUpper or close <= touchLower)
+        usedLiveBar := time
+        int d = close <= touchLower ? 1 : -1
+        LivePosition p = LivePosition.new(time, d, now, now, close, 0, 0)
+        array.push(la, p)
+        f_inc(ls, 0, 1)
+        array.push(events, f_json(f_snapshot(p), now, "touch", 0, float(na)))
+        array.push(liveMarks, Mark.new(now, close, d, 0))
+    livePrevious := now
+    // rollbackで消える現在5分内のラベルを、保存済みイベントから各更新時に再描画。
+    if showLive and array.size(liveMarks) > 0
+        for mark in liveMarks
+            f_mark(mark.at, mark.price, mark.direction, mark.code, true)
+    if jsonAlerts and array.size(events) > 0
+        string payload = "{\"schema\":\"wemof_observer_v2_live\",\"symbol\":\"" + syminfo.tickerid + "\",\"chart_tf\":\"5\",\"processing\":\"received_updates\",\"bb_length\":" + str.tostring(n) + ",\"sigma\":" + f_number(k) + ",\"target_pips\":" + f_number(target) + ",\"stop_pips\":" + f_number(stop) + ",\"cost_pips\":" + f_number(cost) + ",\"watch_minutes\":" + str.tostring(watch) + ",\"live_gap_seconds\":" + str.tostring(liveGap) + ",\"events\":[" + array.join(events, ",") + "]}"
+        alert(payload, alert.freq_all)
+
+plot(showBB ? basis : na, "5m BB basis", color=color.gray)
+plot(showBB ? basis + dev : na, "5m BB upper", color=color.blue)
+plot(showBB ? basis - dev : na, "5m BB lower", color=color.blue)
+plot(showBoundary ? touchUpper : na, "Touch boundary upper", color=color.orange, style=plot.style_stepline)
+plot(showBoundary ? touchLower : na, "Touch boundary lower", color=color.orange, style=plot.style_stepline)
+plot(contactId, "History touch ID ms", display=display.data_window)
+plot(contactDirection, "History touch direction", display=display.data_window)
+plot(contactReference, "History touch reference", display=display.data_window)
+plot(contactAt, "History touch confirmed ms", display=display.data_window)
+plot(finished, "History completed this 5m", display=display.data_window)
+plot(array.get(output, 0), "History result 1 ID ms", display=display.data_window)
+plot(array.get(output, 1), "History result 1 direction", display=display.data_window)
+plot(array.get(output, 2), "History result 1 reference", display=display.data_window)
+plot(array.get(output, 3), "History result 1 code", display=display.data_window)
+plot(array.get(output, 4), "History result 1 elapsed seconds", display=display.data_window)
+plot(array.get(output, 5), "History result 1 MAE upper pips", display=display.data_window)
+plot(array.get(output, 6), "History result 1 MFE upper pips", display=display.data_window)
+plot(array.get(output, 7), "History result 1 known net pips", display=display.data_window)
+plot(array.get(output, 8), "History result 1 observed ms", display=display.data_window)
+plot(array.get(output, 9), "History result 2 ID ms", display=display.data_window)
+plot(array.get(output, 10), "History result 2 direction", display=display.data_window)
+plot(array.get(output, 11), "History result 2 reference", display=display.data_window)
+plot(array.get(output, 12), "History result 2 code", display=display.data_window)
+plot(array.get(output, 13), "History result 2 elapsed seconds", display=display.data_window)
+plot(array.get(output, 14), "History result 2 MAE upper pips", display=display.data_window)
+plot(array.get(output, 15), "History result 2 MFE upper pips", display=display.data_window)
+plot(array.get(output, 16), "History result 2 known net pips", display=display.data_window)
+plot(array.get(output, 17), "History result 2 observed ms", display=display.data_window)
+plot(array.get(output, 18), "History result 3 ID ms", display=display.data_window)
+plot(array.get(output, 19), "History result 3 direction", display=display.data_window)
+plot(array.get(output, 20), "History result 3 reference", display=display.data_window)
+plot(array.get(output, 21), "History result 3 code", display=display.data_window)
+plot(array.get(output, 22), "History result 3 elapsed seconds", display=display.data_window)
+plot(array.get(output, 23), "History result 3 MAE upper pips", display=display.data_window)
+plot(array.get(output, 24), "History result 3 MFE upper pips", display=display.data_window)
+plot(array.get(output, 25), "History result 3 known net pips", display=display.data_window)
+plot(array.get(output, 26), "History result 3 observed ms", display=display.data_window)
+plot(array.get(output, 27), "History result 4 ID ms", display=display.data_window)
+plot(array.get(output, 28), "History result 4 direction", display=display.data_window)
+plot(array.get(output, 29), "History result 4 reference", display=display.data_window)
+plot(array.get(output, 30), "History result 4 code", display=display.data_window)
+plot(array.get(output, 31), "History result 4 elapsed seconds", display=display.data_window)
+plot(array.get(output, 32), "History result 4 MAE upper pips", display=display.data_window)
+plot(array.get(output, 33), "History result 4 MFE upper pips", display=display.data_window)
+plot(array.get(output, 34), "History result 4 known net pips", display=display.data_window)
+plot(array.get(output, 35), "History result 4 observed ms", display=display.data_window)
+plot(array.get(hs, 6), "History known net cumulative pips", display=display.data_window)
+plot(array.get(ls, 6), "LIVE reference net session pips reload loses data", display=display.data_window)
+var table panel = table.new(position.top_right, 3, 13, bgcolor=color.new(color.white, 10), border_width=1)
+if barstate.islast
+    table.cell(panel, 0, 0, "WEMOF v2.1 / 5分表示", text_color=color.white, bgcolor=color.navy)
+    table.cell(panel, 1, 0, "履歴：1分OHLC", text_color=color.white, bgcolor=color.navy)
+    table.cell(panel, 2, 0, "LIVE：受信更新", text_color=color.white, bgcolor=color.navy)
+    array<string> names = array.from("接触 / 観測中", "TP / SL / 時間切れ", "順序不明 / 空白中断", "TP/(TP+SL) ※期限除外", "既知結果のみ参考pips", "TP平均確認秒数", "MAE平均pips", "MFE平均pips", "判定の開始", "判定の終了", "利用できる1分足", "参考価格 / 約定未測定")
+    for column = 1 to 2
+        array<float> s = column == 1 ? hs : ls
+        float tp = array.get(s, 1)
+        float sl = array.get(s, 2)
+        float count = array.get(s, 8)
+        string ratio = tp + sl > 0 ? str.tostring(100 * tp / (tp + sl), "0.0") + "%" : "—"
+        int from = column == 1 ? historicalFirst : liveStarted
+        int until = column == 1 ? historicalLast : livePrevious
+        string fromText = na(from) ? "まだなし" : str.format_time(from, "MM-dd HH:mm:ss", "Asia/Tokyo")
+        string untilText = na(until) ? "まだなし" : str.format_time(until, "MM-dd HH:mm:ss", "Asia/Tokyo")
+        array<string> values = array.from(str.tostring(array.get(s, 0), "#") + " / " + str.tostring(column == 1 ? array.size(ha) : array.size(la)), str.tostring(tp, "#") + " / " + str.tostring(sl, "#") + " / " + str.tostring(array.get(s, 3), "#"), str.tostring(array.get(s, 4), "#") + " / " + str.tostring(array.get(s, 5), "#"), ratio, str.tostring(array.get(s, 6), "0.0"), tp > 0 ? str.tostring(array.get(s, 7) / tp, "0.0") : "—", count > 0 ? str.tostring(array.get(s, 9) / count, "0.00") : "—", count > 0 ? str.tostring(array.get(s, 10) / count, "0.00") : "—", fromText, untilText, column == 1 ? str.tostring(available) + "本/現在5分・空配列足 " + str.tostring(noMinuteBars) : "再読み込みで消える", column == 1 ? "1分内の順序は復元不可" : "5分確定を待たない")
+        for row = 0 to 11
+            if column == 1
+                table.cell(panel, 0, row + 1, array.get(names, row), text_color=color.navy, text_size=size.small)
+            table.cell(panel, column, row + 1, array.get(values, row), text_color=color.navy, text_size=size.small)

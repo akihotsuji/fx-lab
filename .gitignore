@@ -1,0 +1,8 @@
+/vendor/
+/build/
+/data/
+/logs/
+*.class
+__pycache__/
+*.pyc
+*.zip

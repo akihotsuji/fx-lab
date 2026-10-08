@@ -1,0 +1,11 @@
+{
+  "length": 20,
+  "sigma": 3.0,
+  "target": 3.0,
+  "stop": 10.0,
+  "watch_ms": 900000,
+  "max_gap_ms": 60000,
+  "additional_cost": 0.0,
+  "max_spread": 0.0,
+  "model": "BID_ASK"
+}
